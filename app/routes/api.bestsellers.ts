@@ -157,8 +157,29 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
   return false;
 }
 
-function isExcludedSpecialPrice(tags?: string[]) {
-  return (tags || []).some((tag) => tag.trim().toLowerCase().includes("oi25-rebajas"));
+/* Etiquetas a excluir. Antes estaba clavado "oi25-rebajas", que ademas
+   NO existe en la tienda (los tags de esa campana son
+   "segundas-rebajas-oi25" y "terceras-rebajas-oi25"), asi que el filtro
+   no descartaba nada. Ahora la lista llega por querystring desde el
+   customizer del tema (exclude_tags), para que marketing ponga la
+   etiqueta de la campana vigente sin tocar codigo ni desplegar.
+   Se compara por "contiene", como antes. Sin lista, no se excluye nada. */
+const DEFAULT_EXCLUDE_TAGS: string[] = [];
+
+function parseExcludeTags(raw: string | null): string[] {
+  if (!raw) return DEFAULT_EXCLUDE_TAGS;
+  return raw
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isExcludedSpecialPrice(tags: string[] | undefined, excluded: string[]) {
+  if (!excluded.length) return false;
+  return (tags || []).some((tag) => {
+    const t = tag.trim().toLowerCase();
+    return excluded.some((ex) => t.includes(ex));
+  });
 }
 
 /* ======================== F E C H A S (FIX) ======================== */
@@ -252,16 +273,34 @@ async function redisSet(key: string, value: Resp, ttlSec: number) {
 const CACHE_VER = "v9";
 const SNAPSHOT_CACHE_VER = "v7";
 const SNAPSHOT_DAYS = Math.max(1, Number(process.env.BESTSELLERS_SNAPSHOT_DAYS || 15));
-function k(fromISO: string, toISO: string, segs: Set<Segment>, limit: number, channel: string) {
-  return `bestsellers:${CACHE_VER}:${fromISO}:${toISO}:${[...segs].sort().join(",")}:${limit}:${channel}`;
+function k(
+  fromISO: string,
+  toISO: string,
+  segs: Set<Segment>,
+  limit: number,
+  channel: string,
+  exclude: string
+) {
+  return `bestsellers:${CACHE_VER}:${fromISO}:${toISO}:${[...segs]
+    .sort()
+    .join(",")}:${limit}:${channel}:${exclude}`;
 }
 function snapKey(segs: Set<Segment>, limit: number, channel: string) {
   return `bestsellers:${SNAPSHOT_CACHE_VER}:snapshot:last${SNAPSHOT_DAYS}:${[...segs]
     .sort()
     .join(",")}:${limit}:${channel}`;
 }
+/* Candidatos de snapshot, de menos a mas pero NUNCA por debajo de lo
+   que se pide. Antes se ordenaba la lista entera y se cogia el primero
+   que existiera, asi que una coleccion configurada a 40 se servia del
+   snapshot de 19 y enseñaba 19 productos (medido en produccion:
+   limit=40 devolvia snapshot_limit 19). Si no hay ninguno igual o mayor
+   se recurre a los menores, que es mejor que no enseñar nada. */
 function snapshotCandidateLimits(limit: number) {
-  return [...new Set([limit, 19, 40, 60, 100])].sort((a, b) => a - b);
+  const todos = [...new Set([limit, 19, 40, 60, 100])].sort((a, b) => a - b);
+  const suficientes = todos.filter((l) => l >= limit);
+  const insuficientes = todos.filter((l) => l < limit).sort((a, b) => b - a);
+  return [...suficientes, ...insuficientes];
 }
 
 /* ======================= L O A D E R ======================= */
@@ -277,6 +316,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const debug = url.searchParams.get("debug") === "1";
   const nocache = url.searchParams.get("nocache") === "1";
   const channelFilter = (url.searchParams.get("channel") || "all").toLowerCase();
+  const excludeTags = parseExcludeTags(url.searchParams.get("exclude_tags"));
+  const excludeKey = excludeTags.join("|");
 
   // =========================
   // Fechas (FIX)
@@ -306,7 +347,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // =========================
   // Caché
   // =========================
-  const key = k(fromISO, toISO, segments, limit, channelFilter);
+  const key = k(fromISO, toISO, segments, limit, channelFilter, excludeKey);
   const now = Date.now();
 
   // Para colecciones automáticas queremos responder desde snapshot precalculado
@@ -315,13 +356,41 @@ export async function loader({ request }: LoaderFunctionArgs) {
     for (const snapLimit of snapshotCandidateLimits(limit)) {
       const sHit = await redisGet(snapKey(segments, snapLimit, channelFilter));
       if (!sHit) continue;
+      let handlesSnap: string[] = sHit.handles || [];
+
+      /* El snapshot se precalcula sin saber que etiquetas querra excluir
+         el customizer, y solo guarda handles. Si llega una lista, hay que
+         mirar los tags de esos productos y descartarlos aqui; si no, el
+         ajuste no tendria ningun efecto en la web, que es justo la ruta
+         que usa (channel=online&snapshot=1). Es una sola consulta de 40-60
+         handles y el resultado se queda en la cache con su propia clave. */
+      if (excludeTags.length && handlesSnap.length) {
+        try {
+          const HANDLES_QUERY = `query H($q:String!){ products(first:250, query:$q){ nodes { handle tags } } }`;
+          type HandlesResp = { products: { nodes: Array<{ handle: string; tags?: string[] }> } };
+          const q = handlesSnap.map((h) => `handle:${h}`).join(" OR ");
+          const data = await adminGQL<HandlesResp>(HANDLES_QUERY, { q });
+          const porHandle = new Map<string, string[]>();
+          for (const n of data?.products?.nodes || []) porHandle.set(n.handle, n.tags || []);
+          handlesSnap = handlesSnap.filter(
+            (h) => !isExcludedSpecialPrice(porHandle.get(h), excludeTags)
+          );
+        } catch {
+          /* si la consulta falla se sirve el snapshot tal cual: mejor la
+             lista completa que una coleccion vacia */
+        }
+      }
+
       const payload: Resp =
-        snapLimit === limit ? sHit : { ...sHit, handles: (sHit.handles || []).slice(0, limit) };
+        snapLimit === limit && !excludeTags.length
+          ? sHit
+          : { ...sHit, handles: handlesSnap.slice(0, limit) };
       if (debug) {
         (payload.meta ??= {}).source = "snapshot";
         (payload.meta ??= {}).snapshot_days = SNAPSHOT_DAYS;
         (payload.meta ??= {}).snapshot_limit = snapLimit;
         (payload.meta ??= {}).range = { from: fromISO, to: toISO };
+        (payload.meta ??= {}).exclude_tags = excludeTags;
       }
       return new Response(JSON.stringify(payload), { headers: corsHeaders(origin) });
     }
@@ -421,7 +490,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           scanned++;
           const p = li.product;
           if (!p) continue;
-          if (isExcludedSpecialPrice(p.tags)) continue;
+          if (isExcludedSpecialPrice(p.tags, excludeTags)) continue;
           if (!passSegments({ tags: p.tags, productType: p.productType }, segments)) continue;
           qtyByProductId.set(p.id, (qtyByProductId.get(p.id) || 0) + li.quantity);
         }
@@ -456,7 +525,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
     resp.handles = (nd.nodes || [])
       .filter(Boolean)
-      .filter((n) => !isExcludedSpecialPrice(n!.tags))
+      .filter((n) => !isExcludedSpecialPrice(n!.tags, excludeTags))
       .map((n) => n!.handle)
       .filter((h): h is string => Boolean(h));
 

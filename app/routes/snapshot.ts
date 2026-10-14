@@ -299,11 +299,35 @@ export async function loader({ request }: LoaderFunctionArgs) {
     }
   }
 
-  // 2) Calcula y guarda snapshots para TODAS las combinaciones (incluida empty = "all")
-  const combos = allCombinations<Segment>(SEGMENTS, true); // 16 sets (2^4)
+  /* 2) Combinaciones. Antes se generaban TODAS (el comentario decia
+     "16 sets (2^4)", pero con el segmento girl ya son 32, mas el vacio
+     que allCombinations mete dos veces: 33 pasadas). Cada pasada son una
+     consulta a Shopify y cuatro escrituras en Redis, y 27 de ellas eran
+     mezclas que nadie pide: el tema manda un solo segmento por coleccion.
+     Se dejan los segmentos sueltos y el vacio ("all"), que son los que
+     existen. Si alguien marcase dos casillas, esa combinacion no tendria
+     snapshot y la API cae al calculo en vivo, que sigue funcionando. */
+  const combos: Array<Set<Segment>> = [new Set<Segment>()];
+  for (const seg of SEGMENTS) combos.push(new Set<Segment>([seg]));
+
+  /* Tope de tiempo. El cron llama con curl sin --max-time, asi que si
+     esto no contesta se queda esperando hasta que Render lo mata: los
+     runs fallidos duran 12h clavadas. Con el presupuesto se responde
+     siempre, aunque sea a medias, y se ve en el JSON que falto. */
+  const BUDGET_MS = Math.max(1, Number(process.env.SNAPSHOT_BUDGET_MIN || 20)) * 60 * 1000;
+  const arranque = Date.now();
+  const hechos: string[] = [];
+  const pendientes: string[] = [];
+
   for (const combo of combos) {
+    const nombre = [...combo].join("+") || "all";
+    if (Date.now() - arranque > BUDGET_MS) {
+      pendientes.push(nombre);
+      continue;
+    }
     // eslint-disable-next-line no-await-in-loop
     await buildAndSaveSnapshotFor(combo);
+    hechos.push(nombre);
   }
 
   // 3) Respuesta
@@ -313,7 +337,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
       snapshot_at: new Date().toISOString(),
       range: { from: fromISO, to: toISO },
       channel: "online",
-      segments: combos.map((s) => [...s].join("+") || "all"),
+      segments: hechos,
+      pending: pendientes,
+      complete: pendientes.length === 0,
+      elapsed_ms: Date.now() - arranque,
       limits,
     }),
     { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
