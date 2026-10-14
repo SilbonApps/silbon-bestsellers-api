@@ -290,8 +290,17 @@ function snapKey(segs: Set<Segment>, limit: number, channel: string) {
     .sort()
     .join(",")}:${limit}:${channel}`;
 }
+/* Candidatos de snapshot, de menos a mas pero NUNCA por debajo de lo
+   que se pide. Antes se ordenaba la lista entera y se cogia el primero
+   que existiera, asi que una coleccion configurada a 40 se servia del
+   snapshot de 19 y enseñaba 19 productos (medido en produccion:
+   limit=40 devolvia snapshot_limit 19). Si no hay ninguno igual o mayor
+   se recurre a los menores, que es mejor que no enseñar nada. */
 function snapshotCandidateLimits(limit: number) {
-  return [...new Set([limit, 19, 40, 60, 100])].sort((a, b) => a - b);
+  const todos = [...new Set([limit, 19, 40, 60, 100])].sort((a, b) => a - b);
+  const suficientes = todos.filter((l) => l >= limit);
+  const insuficientes = todos.filter((l) => l < limit).sort((a, b) => b - a);
+  return [...suficientes, ...insuficientes];
 }
 
 /* ======================= L O A D E R ======================= */
