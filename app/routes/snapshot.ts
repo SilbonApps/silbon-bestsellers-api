@@ -15,9 +15,22 @@ const SNAPSHOT_DAYS = Math.max(1, Number(process.env.BESTSELLERS_SNAPSHOT_DAYS |
 const SEGMENTS: Segment[] = ["man", "woman", "teens", "kids", "girl"];
 
 /** Clave de snapshot: últimos 30 días + conjunto de segmentos + límite */
-function snapKey(segs: Set<Segment>, limit: number, channel = "online") {
+/* Ventanas (en dias) que se precalculan. El customizer del tema elige
+   una de ellas y la pide con &days=N; si pidiera una que no se ha
+   guardado, la API cae al calculo en vivo, que tarda minutos. Por eso
+   el cron guarda varias y el desplegable del tema ofrece esas mismas. */
+function parseDays(url: URL): number[] {
+  const crudo = (url.searchParams.get("days") || "").trim();
+  const lista = crudo
+    ? crudo.split(",").map((s) => Math.floor(Number(s.trim()))).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  const unicos = [...new Set(lista.length ? lista : [SNAPSHOT_DAYS])];
+  return unicos.sort((a, b) => a - b);
+}
+
+function snapKey(segs: Set<Segment>, limit: number, channel = "online", days = SNAPSHOT_DAYS) {
   // OJO: key estable (segs ordenados, empty set = "")
-  return `bestsellers:${CACHE_VER}:snapshot:last${SNAPSHOT_DAYS}:${[...segs]
+  return `bestsellers:${CACHE_VER}:snapshot:last${days}:${[...segs]
     .sort()
     .join(",")}:${limit}:${channel}`;
 }
@@ -193,9 +206,18 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // Config: múltiples límites o uno solo
   const limits = parseLimits(url); // p.ej. [20,60,100]
 
+  /* Ventanas a guardar. Se descargan los pedidos UNA sola vez con la
+     mas larga y las cortas se sacan en memoria filtrando por fecha: lo
+     caro es paginar Shopify (5.000 pedidos en 15 dias, 54 paginas), no
+     contar. */
+  const ventanas = parseDays(url);
+  const diasMax = Math.max(...ventanas);
+
   // Últimos N días (normalizado a bordes de día UTC)
   const toISO = endOfDayUTC(new Date()).toISOString();
-  const fromISO = startOfDayUTC(new Date(Date.now() - SNAPSHOT_DAYS * 24 * 3600 * 1000)).toISOString();
+  const fromISO = startOfDayUTC(new Date(Date.now() - diasMax * 24 * 3600 * 1000)).toISOString();
+  const desdeDe = (dias: number) =>
+    startOfDayUTC(new Date(Date.now() - dias * 24 * 3600 * 1000)).toISOString();
 
   const searchBase = `financial_status:paid created_at:>=${fromISO} created_at:<=${toISO}`;
   const ORDERS_QUERY = `
@@ -205,6 +227,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         nodes {
           sourceName
           cancelledAt
+          createdAt
           lineItems(first: 100) {
             nodes {
               quantity
@@ -221,6 +244,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
       nodes: Array<{
         sourceName?: string | null;
         cancelledAt?: string | null;
+        createdAt?: string | null;
         lineItems: { nodes: Array<{ quantity: number; product: { id: string; handle: string; tags?: string[]; productType?: string } | null }> };
       }>;
     };
@@ -229,6 +253,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // 1) Descarga una vez todas las órdenes del rango
   const allLineItems: Array<{
     quantity: number;
+    createdAt: string;
     product: { id: string; handle: string; tags?: string[]; productType?: string };
   }> = [];
 
@@ -240,17 +265,25 @@ export async function loader({ request }: LoaderFunctionArgs) {
       if (o.cancelledAt) continue;
       if (!isOnlineSource(o.sourceName)) continue;
       for (const li of o.lineItems.nodes) {
-        if (li.product) allLineItems.push({ quantity: li.quantity, product: li.product });
+        if (li.product) {
+          allLineItems.push({
+            quantity: li.quantity,
+            createdAt: o.createdAt || fromISO,
+            product: li.product,
+          });
+        }
       }
     }
     cursor = pageInfo.hasNextPage ? pageInfo.endCursor : null;
   } while (cursor);
 
   // Helper para construir y guardar snapshots para un set de segmentos en TODOS los límites pedidoss
-  async function buildAndSaveSnapshotFor(segs: Set<Segment>) {
+  async function buildAndSaveSnapshotFor(segs: Set<Segment>, dias: number) {
     const qtyByProductId = new Map<string, number>();
+    const desdeISO = desdeDe(dias);
 
     for (const li of allLineItems) {
+      if (li.createdAt < desdeISO) continue;
       const p = li.product;
       if (isExcludedSpecialPrice(p.tags)) continue;
       if (!passSegments({ tags: p.tags, productType: p.productType }, segs)) continue;
@@ -260,11 +293,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
     // Si no hay ventas, guardar vacío para todos los límites
     if (!qtyByProductId.size) {
       for (const L of limits) {
-        await redisSet(snapKey(segs, L), {
+        await redisSet(snapKey(segs, L, "online", dias), {
           handles: [],
           meta: {
             snapshot_at: new Date().toISOString(),
-            range: { from: fromISO, to: toISO },
+            snapshot_days: dias,
+            range: { from: desdeISO, to: toISO },
             segments: [...segs],
             channel: "online",
             source: "snapshot",
@@ -293,11 +327,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
     // Guardamos todas las variantes de límite recortando del máximo
     for (const L of limits) {
       const handles = handlesMax.slice(0, L);
-      await redisSet(snapKey(segs, L), {
+      await redisSet(snapKey(segs, L, "online", dias), {
         handles,
         meta: {
           snapshot_at: new Date().toISOString(),
-          range: { from: fromISO, to: toISO },
+          snapshot_days: dias,
+          range: { from: desdeISO, to: toISO },
           segments: [...segs],
           channel: "online",
           source: "snapshot",
@@ -328,13 +363,16 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   for (const combo of combos) {
     const nombre = [...combo].join("+") || "all";
-    if (Date.now() - arranque > BUDGET_MS) {
-      pendientes.push(nombre);
-      continue;
+    for (const dias of ventanas) {
+      const etiqueta = `${nombre}/${dias}d`;
+      if (Date.now() - arranque > BUDGET_MS) {
+        pendientes.push(etiqueta);
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await buildAndSaveSnapshotFor(combo, dias);
+      hechos.push(etiqueta);
     }
-    // eslint-disable-next-line no-await-in-loop
-    await buildAndSaveSnapshotFor(combo);
-    hechos.push(nombre);
   }
 
   // 3) Respuesta
@@ -349,6 +387,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
       complete: pendientes.length === 0,
       elapsed_ms: Date.now() - arranque,
       limits,
+      days: ventanas,
     }),
     { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
   );
