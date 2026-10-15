@@ -143,7 +143,9 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
   }
 
   if (wantsKids && !wantsMan && !wantsWoman && !wantsTeens && !wantsGirl) {
-    return okKids && !okWoman && !okMan;
+    /* Niño no saca niña (Javier 15-10-2026): un producto etiquetado
+       tambien como GIRL se queda fuera de niño. */
+    return okKids && !okWoman && !okMan && !okGirl;
   }
 
   if (wantsGirl && !wantsMan && !wantsWoman && !wantsTeens && !wantsKids) {
@@ -151,7 +153,7 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
   }
 
   if (wantsTeens && okTeens && !okWoman && !okGirl && !okKids) return true;
-  if (wantsKids && okKids && !okWoman && !okMan) return true;
+  if (wantsKids && okKids && !okWoman && !okMan && !okGirl) return true;
   if (wantsGirl && okGirl && !okWoman && !okMan) return true;
 
   return false;
