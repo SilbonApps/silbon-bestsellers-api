@@ -55,7 +55,12 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
     man: ["gender:man", "gender:men", "man", "men", "caballero", "mens", "hombre", "hombres"] as const,
     woman: ["gender:woman", "woman", "women", "mujer", "mujeres", "dama", "womens", "ladies", "fem"] as const,
     teens: ["segment:teens", "teen", "teens", "juvenil", "adolesc"] as const,
-    kids: ["segment:kids", "kid", "kids", "niño", "nino", "niña", "nina", "infantil", "children", "child"] as const,
+    /* Sin "niña"/"nina": estaban aqui y hacian que la ropa de niña
+       contara como niño (la camiseta girl cuello bobo, con el tag
+       "nuevo-nina", salia la primera en MAS VENDIDOS NIÑO). Niña tiene
+       su propio segmento. En api.bestsellers.ts esta lista nunca las
+       tuvo: eran dos copias que habian divergido. */
+    kids: ["segment:kids", "kid", "kids", "niño", "nino", "boy", "boys", "infantil", "children", "child"] as const,
   };
   const okMan = hasAnyToken(tagsTokens, TOK.man) || hasAnyToken(ptTokens, TOK.man);
   const okWoman = hasAnyToken(tagsTokens, TOK.woman) || hasAnyToken(ptTokens, TOK.woman);
@@ -80,7 +85,9 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
   }
 
   if (!ok && wantsKids && !wantsMan && !wantsWoman && !wantsTeens && !wantsGirl) {
-    ok = okKids && !okWoman && !okMan;
+    /* Niño no saca niña (Javier 15-10-2026): un producto etiquetado
+       tambien como GIRL se queda fuera de niño. */
+    ok = okKids && !okWoman && !okMan && !okGirl;
   }
 
   if (!ok && wantsGirl && !wantsMan && !wantsWoman && !wantsTeens && !wantsKids) {
@@ -89,7 +96,7 @@ function passSegments(p: { tags?: string[]; productType?: string }, segments: Se
 
   if (!ok) {
     if (wantsTeens && okTeens && !okWoman && !okKids && !okGirl) ok = true;
-    if (wantsKids && okKids && !okWoman && !okMan) ok = true;
+    if (wantsKids && okKids && !okWoman && !okMan && !okGirl) ok = true;
     if (wantsGirl && okGirl && !okWoman && !okMan) ok = true;
   }
   return ok;
