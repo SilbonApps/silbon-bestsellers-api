@@ -10,12 +10,19 @@
  *   APP_PUBLIC_URL   base de la app, sin barra final
  *   SNAPSHOT_SECRET  secreto que exige /snapshot
  *   SNAPSHOT_LIMITS  opcional, por defecto 19,40,60,100
+ *   SNAPSHOT_DAYS    opcional, ventanas en dias; por defecto 7,15,30
  *   SNAPSHOT_TIMEOUT opcional, segundos antes de cortar; por defecto 1800
+ *
+ * Las ventanas son las que ofrece el desplegable del customizer. Si el
+ * tema pidiera una que no esta guardada, la API cae al calculo en vivo
+ * y la pagina tarda minutos en pintar, asi que las dos listas tienen
+ * que ir a la par.
  */
 
 const base = process.env.APP_PUBLIC_URL;
 const secret = process.env.SNAPSHOT_SECRET;
 const limits = process.env.SNAPSHOT_LIMITS || '19,40,60,100';
+const dias = process.env.SNAPSHOT_DAYS || '7,15,30';
 const timeoutS = Number(process.env.SNAPSHOT_TIMEOUT || 1800);
 
 if (!base || !secret) {
@@ -29,6 +36,7 @@ if (!base || !secret) {
 const url = new URL('/snapshot', base);
 url.searchParams.set('secret', secret);
 url.searchParams.set('limits', limits);
+url.searchParams.set('days', dias);
 
 // Para los logs, sin el secreto.
 const visible = new URL(url);

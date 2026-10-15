@@ -287,10 +287,20 @@ function k(
     .sort()
     .join(",")}:${limit}:${channel}:${exclude}`;
 }
-function snapKey(segs: Set<Segment>, limit: number, channel: string) {
-  return `bestsellers:${SNAPSHOT_CACHE_VER}:snapshot:last${SNAPSHOT_DAYS}:${[...segs]
+function snapKey(segs: Set<Segment>, limit: number, channel: string, days: number) {
+  return `bestsellers:${SNAPSHOT_CACHE_VER}:snapshot:last${days}:${[...segs]
     .sort()
     .join(",")}:${limit}:${channel}`;
+}
+
+/* Ventana en dias. La elige el customizer del tema y vale para los dos
+   caminos: el snapshot que se lee y el calculo en vivo si no lo hay.
+   Antes el snapshot miraba 15 dias y el calculo en vivo 7, asi que la
+   misma coleccion daba una lista u otra segun por donde entrara. */
+function parseDays(url: URL): number {
+  const crudo = Number(url.searchParams.get("days"));
+  if (!Number.isFinite(crudo) || crudo <= 0) return SNAPSHOT_DAYS;
+  return Math.min(365, Math.floor(crudo));
 }
 /* Candidatos de snapshot, de menos a mas pero NUNCA por debajo de lo
    que se pide. Antes se ordenaba la lista entera y se cogia el primero
@@ -327,10 +337,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const toParam = url.searchParams.get("to");
   const fromParam = url.searchParams.get("from");
 
+  const dias = parseDays(url);
   const toDate = toParam ? parseDateParamUTC(toParam, true) : new Date();
   const fromDate = fromParam
     ? parseDateParamUTC(fromParam, false)
-    : new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    : new Date(Date.now() - dias * 24 * 3600 * 1000);
 
   const toISO = toDate.toISOString();
   const fromISO = fromDate.toISOString();
@@ -356,7 +367,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // y solo caer al cálculo en vivo si no existe todavía.
   if (!nocache && channelFilter === "online" && url.searchParams.get("snapshot") !== "0") {
     for (const snapLimit of snapshotCandidateLimits(limit)) {
-      const sHit = await redisGet(snapKey(segments, snapLimit, channelFilter));
+      const sHit = await redisGet(snapKey(segments, snapLimit, channelFilter, dias));
       if (!sHit) continue;
       let handlesSnap: string[] = sHit.handles || [];
 
@@ -389,7 +400,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           : { ...sHit, handles: handlesSnap.slice(0, limit) };
       if (debug) {
         (payload.meta ??= {}).source = "snapshot";
-        (payload.meta ??= {}).snapshot_days = SNAPSHOT_DAYS;
+        (payload.meta ??= {}).snapshot_days = dias;
         (payload.meta ??= {}).snapshot_limit = snapLimit;
         (payload.meta ??= {}).range = { from: fromISO, to: toISO };
         (payload.meta ??= {}).exclude_tags = excludeTags;
